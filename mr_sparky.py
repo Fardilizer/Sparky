@@ -16,6 +16,10 @@ def move_function(dir, power, time):
     mr_sparky.set_motor(power, power -power, -power)
   elif dir == "t_right":
     mr_sparky.set_motor(-power, -power, power, power)
+    
+  time.sleep(time)
+  
+  mr_sparky.set_motor(0, 0, 0, 0)
 
 def main_function():
   mr_sparky.set_motor(-40, 40, 40, -40)
