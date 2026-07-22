@@ -3,7 +3,7 @@ from sparkybotmini import SparkyBotMini
 
 mr_sparky = SparkyBotMini(port = "/dev/ttyUSB0")
 
-def move_function(dir, power, time):
+def move_func_t(dir, power, time):
   if dir == "forward":
     mr_sparky.set_motor(power, power, power, power)
   elif dir == "backward":
