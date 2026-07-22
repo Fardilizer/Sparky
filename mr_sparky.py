@@ -8,6 +8,7 @@ def main_function():
 
 if mr_sparky.connect():
   print("MrSparky has been connected")
+  main_function()
 else:
   print("problem connecting to MrSparky")
   exit()
