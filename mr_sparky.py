@@ -42,7 +42,7 @@ def drive_forward_5_seconds(power: int = 75):
     print("? Forward motion complete")
 
 def main_function():
-  mr_sparky.set_motor(-40, 40, 40, -40)
+  drive_forward_5_seconds()
 
 if mr_sparky.connect():
   print("MrSparky has been connected")
