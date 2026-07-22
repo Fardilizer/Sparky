@@ -21,6 +21,7 @@ def move_function(dir, power, time):
   
   mr_sparky.set_motor(0, 0, 0, 0)
 
+# AI function
 def drive_forward_5_seconds(power: int = 75):
     """
     Drive the robot forward for 5 seconds using Mecanum wheels.
