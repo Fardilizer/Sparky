@@ -21,6 +21,26 @@ def move_function(dir, power, time):
   
   mr_sparky.set_motor(0, 0, 0, 0)
 
+def drive_forward_5_seconds(power: int = 75):
+    """
+    Drive the robot forward for 5 seconds using Mecanum wheels.
+    
+    For Mecanum wheels in forward motion, all motors rotate in the same direction
+    with the same power level. This leverages your drivetrain specs:
+    - 4x 12V 550 RPM motors
+    - 2" diameter Mecanum wheels
+    - 5" x 8" wheelbase
+    
+    Args:
+        power: Motor power level (0-100). Default 75 for balanced speed/control.
+               Recommended range: 60-85 for stable forward motion.
+    """
+    print(f"? Driving forward at {power}% power for 5 seconds...")
+    mr_sparky.set_motor(power, power, power, power)
+    time.sleep(5)
+    mr_sparky.set_motor(0, 0, 0, 0)
+    print("? Forward motion complete")
+
 def main_function():
   mr_sparky.set_motor(-40, 40, 40, -40)
 
