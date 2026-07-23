@@ -1,0 +1,13 @@
+def move_func_t(dir, power, time):
+  if dir == "forward":
+    mr_sparky.set_motor(power, power, power, power)
+  elif dir == "backward":
+    mr_sparky.set_motor(-power, -power, -power, -power)
+  elif dir == "right":
+    mr_sparky.set_motor(power, -power, power, -power)
+  elif dir == "left":
+    mr_sparky.set_motor(-power, power, -power, power)
+  elif dir == "t_left":
+    mr_sparky.set_motor(power, power -power, -power)
+  elif dir == "t_right":
+    mr_sparky.set_motor(-power, -power, power, power)
