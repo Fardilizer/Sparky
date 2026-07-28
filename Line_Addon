@@ -1,0 +1,255 @@
+"""
+line_and_crop_processor.py
+
+Drop-in module to run line-following and crop/base detection concurrently on Raspberry Pi (OpenCV).
+Replace `detect_crops(frame)` with your existing detection function or import it.
+
+Usage:
+    from line_and_crop_processor import LineAndCropProcessor
+    def steering_callback(steer, speed):
+        # steer: -1.0..1.0 (left..right), speed: 0..1
+        # send to motor controller
+        pass
+
+    proc = LineAndCropProcessor(steering_callback, crop_detector=your_detect_fn)
+    proc.start()
+    # ... later
+    proc.stop()
+"""
+
+import cv2
+import threading
+import time
+import numpy as np
+from collections import deque
+from typing import Callable, Optional
+
+# -------------------------
+# Configuration (tune these)
+# -------------------------
+DEFAULT_WIDTH = 640
+DEFAULT_HEIGHT = 360
+CAPTURE_FPS = 30                # target capture FPS
+LINE_PROCESS_FPS = 30           # how often to compute steering
+CROP_DETECT_FPS = 3             # how often to run heavy detection
+ROI_HEIGHT_RATIO = 0.35         # bottom portion of frame to search for line
+SMOOTHING_WINDOW = 5            # smoothing for steering output
+# -------------------------
+
+def default_crop_detector(frame: np.ndarray):
+    """
+    Placeholder. Replace or pass your detection function.
+    Should return a list of detections, e.g. [{'type':'fake_corn','bbox':(x,y,w,h), 'score':0.9}, ...]
+    """
+    return []
+
+class CameraCaptureThread(threading.Thread):
+    """
+    Dedicated capture thread to keep frames flowing.
+    Uses cv2.VideoCapture; on Pi you can switch to libcamera if needed.
+    """
+    def __init__(self, src=0, width=DEFAULT_WIDTH, height=DEFAULT_HEIGHT, fps=CAPTURE_FPS):
+        super().__init__(daemon=True)
+        self.src = src
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.cap = None
+        self.running = threading.Event()
+        self.frame_lock = threading.Lock()
+        self.latest_frame = None
+        self.last_read_time = 0.0
+
+    def run(self):
+        # Try to open camera; prefer libcamera backend on Pi if available
+        self.cap = cv2.VideoCapture(self.src, cv2.CAP_V4L2)
+        # set resolution
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.width)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.height)
+        # set FPS hint
+        self.cap.set(cv2.CAP_PROP_FPS, self.fps)
+
+        self.running.set()
+        target_period = 1.0 / max(1, self.fps)
+        while self.running.is_set():
+            t0 = time.time()
+            ret, frame = self.cap.read()
+            if not ret:
+                # small sleep to avoid busy loop if camera fails
+                time.sleep(0.01)
+                continue
+            with self.frame_lock:
+                self.latest_frame = frame
+                self.last_read_time = t0
+            # sleep to target fps (non-blocking capture still reads as fast as camera provides)
+            elapsed = time.time() - t0
+            to_sleep = target_period - elapsed
+            if to_sleep > 0:
+                time.sleep(to_sleep)
+
+    def get_frame(self):
+        with self.frame_lock:
+            if self.latest_frame is None:
+                return None, None
+            # return a copy to avoid races
+            return self.latest_frame.copy(), self.last_read_time
+
+    def stop(self):
+        self.running.clear()
+        if self.cap:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+
+class LineAndCropProcessor:
+    """
+    High-level orchestrator: capture -> line follow -> crop detection (async)
+    """
+    def __init__(
+        self,
+        steering_callback: Callable[[float, float], None],
+        crop_detector: Optional[Callable[[np.ndarray], list]] = None,
+        camera_src=0,
+        width=DEFAULT_WIDTH,
+        height=DEFAULT_HEIGHT,
+        capture_fps=CAPTURE_FPS,
+        line_fps=LINE_PROCESS_FPS,
+        crop_fps=CROP_DETECT_FPS,
+    ):
+        self.capture = CameraCaptureThread(src=camera_src, width=width, height=height, fps=capture_fps)
+        self.steering_callback = steering_callback
+        self.crop_detector = crop_detector or default_crop_detector
+        self.line_period = 1.0 / max(1, line_fps)
+        self.crop_period = 1.0 / max(0.1, crop_fps)
+        self.running = threading.Event()
+        self.processor_thread = threading.Thread(target=self._processor_loop, daemon=True)
+        self.crop_thread = None
+        self.last_line_time = 0.0
+        self.last_crop_time = 0.0
+        self.steer_history = deque(maxlen=SMOOTHING_WINDOW)
+
+    def start(self):
+        self.capture.start()
+        self.running.set()
+        self.processor_thread.start()
+
+    def stop(self):
+        self.running.clear()
+        self.capture.stop()
+        if self.crop_thread and self.crop_thread.is_alive():
+            self.crop_thread.join(timeout=0.5)
+        if self.processor_thread.is_alive():
+            self.processor_thread.join(timeout=0.5)
+
+    # -------------------------
+    # Line detection utilities
+    # -------------------------
+    def _preprocess_for_line(self, frame: np.ndarray):
+        # Crop to bottom ROI to reduce work
+        h = frame.shape[0]
+        roi_h = int(h * ROI_HEIGHT_RATIO)
+        roi = frame[h - roi_h : h, :, :]
+        # Resize to smaller width for faster processing
+        target_w = 320
+        scale = target_w / roi.shape[1]
+        roi_small = cv2.resize(roi, (target_w, int(roi.shape[0] * scale)), interpolation=cv2.INTER_LINEAR)
+        gray = cv2.cvtColor(roi_small, cv2.COLOR_BGR2GRAY)
+        # Gaussian blur to reduce noise
+        gray = cv2.GaussianBlur(gray, (5, 5), 0)
+        return gray, roi_small
+
+    def _find_line_centroid(self, gray: np.ndarray):
+        # Adaptive threshold to handle lighting; tuned for dark line on lighter ground
+        th = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C,
+                                   cv2.THRESH_BINARY_INV, 15, 7)
+        # Morphology to clean up
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 3))
+        th = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel, iterations=1)
+        # Compute moments to find centroid of largest blob
+        contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None, th
+        # pick largest contour by area
+        c = max(contours, key=cv2.contourArea)
+        M = cv2.moments(c)
+        if M["m00"] == 0:
+            return None, th
+        cx = int(M["m10"] / M["m00"])
+        cy = int(M["m01"] / M["m00"])
+        return (cx, cy), th
+
+    def _compute_steering(self, centroid, frame_w):
+        # centroid x relative to center -> normalized -1..1
+        cx = centroid[0]
+        center = frame_w / 2.0
+        error = (cx - center) / center
+        # simple proportional controller; you can replace with PID
+        Kp = 0.8
+        steer = float(np.clip(Kp * error, -1.0, 1.0))
+        # smoothing
+        self.steer_history.append(steer)
+        smooth = float(np.mean(self.steer_history))
+        # speed scaling: slower when large steering
+        speed = float(np.clip(1.0 - abs(smooth) * 0.7, 0.2, 1.0))
+        return smooth, speed
+
+    # -------------------------
+    # Crop detection runner
+    # -------------------------
+    def _spawn_crop_detection(self, frame_copy):
+        def worker(img):
+            try:
+                detections = self.crop_detector(img)
+                # handle detections: you can add a callback or publish to a queue
+                # For now we print minimal info; replace with your integration
+                if detections:
+                    # Example: call steering_callback with zero speed to stop for inspection
+                    # or send detection events to your main controller
+                    print(f"[CropDetector] detections: {detections}")
+            except Exception as e:
+                print(f"[CropDetector] error: {e}")
+
+        # run in background thread
+        t = threading.Thread(target=worker, args=(frame_copy,), daemon=True)
+        t.start()
+        self.crop_thread = t
+
+    # -------------------------
+    # Main processing loop
+    # -------------------------
+    def _processor_loop(self):
+        while self.running.is_set():
+            frame, ts = self.capture.get_frame()
+            if frame is None:
+                time.sleep(0.005)
+                continue
+
+            now = time.time()
+            # LINE FOLLOWING (high frequency)
+            if now - self.last_line_time >= self.line_period:
+                self.last_line_time = now
+                gray, roi_small = self._preprocess_for_line(frame)
+                centroid, mask = self._find_line_centroid(gray)
+                if centroid is not None:
+                    steer, speed = self._compute_steering(centroid, gray.shape[1])
+                else:
+                    # fallback: no line found -> gentle stop or search behavior
+                    steer, speed = 0.0, 0.25
+                # call steering callback (non-blocking)
+                try:
+                    self.steering_callback(steer, speed)
+                except Exception as e:
+                    # ensure motor code errors don't crash processor
+                    print(f"[Processor] steering callback error: {e}")
+
+            # CROP DETECTION (lower frequency)
+            if now - self.last_crop_time >= self.crop_period:
+                self.last_crop_time = now
+                # pass a resized copy to save memory and CPU in detector
+                small = cv2.resize(frame, (320, int(frame.shape[0] * 320 / frame.shape[1])), interpolation=cv2.INTER_LINEAR)
+                # spawn detection in background so it doesn't block line following
+                self._spawn_crop_detection(small)
+
+            # tiny sleep to yield CPU (keeps loop responsive)
+            time.sleep(0.001)
